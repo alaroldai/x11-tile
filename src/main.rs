@@ -1,521 +1,326 @@
-mod conn;
-mod geometry;
-mod window;
-mod output;
-mod screen;
-mod screen_resources;
+mod xcb_util;
+
+use crate::xcb_util::{geometry::*, window::WindowExt};
+
+use std::str;
 
 use {
-    anyhow::{anyhow, Error},
-    log::trace,
-    structopt::StructOpt,
-    xcb::{base as xbase, randr as xrandr, xproto},
+  anyhow::{anyhow, Error},
+  structopt::StructOpt,
+  xcb::{base as xbase, randr as xrandr, xproto},
 };
-
-use crate::conn::*;
 
 #[derive(StructOpt)]
 struct GlobalOptions {}
 
-mod placement {
+#[derive(StructOpt)]
+struct Fract {
+  num: f32,
+  denom: f32,
+}
 
-    use {
-        anyhow::{anyhow, Error},
-        structopt::StructOpt,
+impl Fract {
+  fn value(&self) -> f32 {
+    self.num / self.denom
+  }
+}
+
+impl std::str::FromStr for Fract {
+  type Err = Error;
+  fn from_str(s: &str) -> Result<Fract, Error> {
+    let parts = s.split('/').collect::<Vec<_>>();
+    Ok(Fract {
+      num: f32::from_str(parts[0])?,
+      denom: f32::from_str(parts[1])?,
+    })
+  }
+}
+
+struct Geometry<'a> {
+  pub setup: xproto::Setup<'a>,
+  pub root_win: xproto::Window,
+  pub root_win_frame: ScreenRect,
+  pub srs: xrandr::GetScreenResourcesCurrentReply,
+  pub display_frames: Vec<ScreenRect>,
+  pub work_areas: Vec<ScreenRect>,
+  pub active_window: xproto::Window,
+  pub active_window_frame: ScreenRect,
+  pub active_window_insets: ScreenInsets,
+}
+
+fn get_geometry(conn: & xbase::Connection) -> Result<Geometry, Error> {
+  let setup = conn.get_setup();
+
+  let screen = setup
+    .roots()
+    .next()
+    .ok_or_else(|| anyhow!("Couldn't unwrap screen 0"))?;
+
+  let root_window = screen.root();
+
+  let root_window_rect = root_window.get_geometry(&conn)?.as_rect();
+
+  let srs = root_window.get_screen_resources_current(&conn)?;
+  let timestamp = srs.config_timestamp();
+
+  let display_frames = srs
+    .outputs()
+    .iter()
+    .filter_map(|o| {
+      let info = xrandr::get_output_info(&conn, *o, timestamp)
+        .get_reply()
+        .ok()?;
+      match info.connection() as u32 {
+        xrandr::CONNECTION_CONNECTED => {
+          let crtc = xrandr::get_crtc_info(&conn, info.crtc(), timestamp)
+            .get_reply()
+            .ok()?;
+          Some(crtc.as_rect())
+        }
+        _ => None,
+      }
+    })
+    .collect();
+
+  let gvec: Vec<i32> =
+    root_window.get_property(&conn, "_NET_WORKAREA", xproto::ATOM_CARDINAL, 4)?;
+
+  let work_area = gvec
+    .as_slice()
+    .chunks(4)
+    .map(|slc| {
+      ScreenRect::new(
+        ScreenPoint::new(slc[0] as i32, slc[1] as i32),
+        ScreenSize::new(slc[2] as i32, slc[3] as i32),
+      )
+    })
+    .collect::<Vec<ScreenRect>>()[0];
+
+  use xcb_util::geometry::*;
+
+  let active_window: xproto::Window =
+    root_window.get_property(&conn, "_NET_ACTIVE_WINDOW", xproto::ATOM_WINDOW, 1)?[0];
+
+  let mut active_window_frame = active_window.get_geometry(&conn)?.as_rect();
+
+  let translated =
+    xproto::translate_coordinates(&conn, active_window, root_window, 0, 0).get_reply()?;
+  active_window_frame.origin.x = translated.dst_x() as i32;
+  active_window_frame.origin.y = translated.dst_y() as i32;
+
+  let insets = active_window.get_property(&conn, "_NET_FRAME_EXTENTS", xproto::ATOM_CARDINAL, 4)?;
+  let insets = if let [left, right, top, bottom] = insets.as_slice() {
+    ScreenInsets::new(*top, *right, *bottom, *left)
+  } else {
+    ScreenInsets::zero()
+  };
+
+  Ok(Geometry {
+    setup,
+    root_win: root_window,
+    root_win_frame: root_window_rect,
+    srs,
+    display_frames,
+    work_areas: vec![work_area],
+    active_window,
+    active_window_frame,
+    active_window_insets: insets,
+  })
+}
+
+#[derive(StructOpt)]
+struct MoveWindowOnOutput {
+  x: Fract,
+  y: Fract,
+  w: Fract,
+  h: Fract,
+}
+
+impl MoveWindowOnOutput {
+  fn run(self, _: GlobalOptions) -> Result<(), Error> {
+    let (conn, _) = xbase::Connection::connect(None)?;
+
+    let geom = get_geometry(&conn)?;
+
+    let current_display = geom
+      .display_frames
+      .iter()
+      .fold(None, |init: Option<ScreenRect>, frame| {
+        let new = frame.intersection(&geom.active_window_frame);
+        match (new, init) {
+          (Some(new), Some(old)) if new.area() > old.area() => Some(*frame),
+          (Some(_), None) => Some(*frame),
+          _ => init,
+        }
+      })
+      .unwrap();
+
+    let display_frame = current_display.intersection(&geom.work_areas[0]).unwrap();
+
+    let pct = DisplayPercentageSpaceRect::new(
+      DisplayPercentageSpacePoint::new(self.x.value(), self.y.value()),
+      DisplayPercentageSpaceSize::new(self.w.value(), self.h.value()),
+    );
+
+    let new_rect = pct
+      .to_rect(display_frame)
+      .inner_rect(geom.active_window_insets);
+
+    dbg!(&new_rect);
+
+    // NOTE: Some window managers (Kwin and XFWM, for example) may refuse to position windows as requested
+    // if they are in a "tiled" or "maximised" state.
+    // In the case of Kwin, this can be fixed by using a window rule to force the "ignore requested geometry" flag to `false`.
+    geom
+      .root_win
+      .move_resize(&conn, geom.active_window, new_rect)?;
+
+    Ok(())
+  }
+}
+
+#[derive(StructOpt)]
+enum Direction {
+  North,
+  South,
+  East,
+  West,
+}
+
+impl std::str::FromStr for Direction {
+  type Err = Error;
+  fn from_str(s: &str) -> Result<Direction, Error> {
+    match s {
+      "h" => Ok(Direction::West),
+      "j" => Ok(Direction::South),
+      "k" => Ok(Direction::North),
+      "l" => Ok(Direction::East),
+      _ => Err(anyhow!("Not a known direction - use hjkl")),
+    }
+  }
+}
+
+#[derive(StructOpt)]
+struct MoveWindowToOutput {
+  direction: Direction,
+}
+
+impl MoveWindowToOutput {
+  fn run(self, _: GlobalOptions) -> Result<(), Error> {
+    let (conn, _) = xbase::Connection::connect(None)?;
+
+    let geom = get_geometry(&conn)?;
+
+    let (x, y) = match self.direction {
+      Direction::West => (-1.0, 0.0),
+      Direction::South => (0.0, 1.0),
+      Direction::North => (0.0, -1.0),
+      Direction::East => (1.0, 0.0),
     };
 
-    #[derive(StructOpt)]
-    pub enum Edge {
-        Top,
-        Bottom,
-        Left,
-        Right,
-    }
+    let direction: euclid::Vector2D<f32, ScreenSpace> = euclid::Vector2D::new(x as f32, y as f32);
 
-    impl std::str::FromStr for Edge {
-        type Err = Error;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            match s {
-                "top" => Ok(Self::Top),
-                "bottom" => Ok(Self::Bottom),
-                "left" => Ok(Self::Left),
-                "right" => Ok(Self::Right),
-                _ => Err(anyhow!("Couldn't parse")),
-            }
+    let current_output_frame = geom
+      .display_frames
+      .iter()
+      .fold(None, |init: Option<ScreenRect>, frame| {
+        let new = frame.intersection(&geom.active_window_frame);
+        println!("Found intersection: {:#?}", new);
+        match (new, init) {
+          (Some(new), Some(old)) if new.area() > old.area() => Some(*frame),
+          (Some(_), None) => Some(*frame),
+          _ => init,
         }
-    }
+      })
+      .and_then(|frame| frame.intersection(&geom.work_areas[0]))
+      .unwrap();
 
-    #[derive(StructOpt)]
-    pub enum Corner {
-        TopLeft,
-        TopRight,
-        BottomLeft,
-        BottomRight,
-    }
+    let new_output_frame = geom
+      .display_frames
+      .iter()
+      .fold(None, |init: Option<ScreenRect>, frame| {
+        let vec: euclid::Vector2D<f32, ScreenSpace> =
+          (frame.center() - current_output_frame.center()).cast::<f32>();
+        let old: Option<euclid::Vector2D<f32, ScreenSpace>> =
+          init.map(|init| (init.center() - current_output_frame.center()).cast::<f32>());
 
-    impl std::str::FromStr for Corner {
-        type Err = Error;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            match s {
-                "top-left" => Ok(Self::TopLeft),
-                "top-right" => Ok(Self::TopRight),
-                "bottom-left" => Ok(Self::BottomLeft),
-                "bottom-right" => Ok(Self::BottomRight),
-                _ => Err(anyhow!("Couldn't parse")),
-            }
+        let projection = vec.dot(direction);
+
+        match old {
+          None if projection > 0.0 => {
+            println!(
+              "Starting with output {:#?} / projection {:#?}",
+              frame, projection
+            );
+            Some(*frame)
+          }
+          Some(old) if projection < old.dot(direction) && projection > 0.0 => {
+            println!(
+              "Replacing projection {} ({}) with {} ({})",
+              init.unwrap(),
+              old.dot(direction),
+              frame,
+              projection
+            );
+            Some(*frame)
+          }
+          _ => {
+            println!(
+              "Ignoring output {:#?} with projection {:#?}",
+              frame, projection
+            );
+            init
+          }
         }
-    }
+      })
+      .unwrap();
 
-    #[derive(StructOpt)]
-    pub enum Quarter {
-        Edge(Edge),
-        Corner(Corner),
-        Centre,
-    }
+    let new_output_frame = new_output_frame.intersection(&geom.work_areas[0]).unwrap();
 
-    impl std::str::FromStr for Quarter {
-        type Err = Error;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            if s.starts_with("edge-") {
-                Ok(Self::Edge(Edge::from_str(s.trim_start_matches("edge-"))?))
-            } else if s.starts_with("corner-") {
-                Ok(Self::Corner(Corner::from_str(
-                    s.trim_start_matches("corner-"),
-                )?))
-            } else if s == "centre" {
-                Ok(Self::Centre)
-            } else {
-                Err(anyhow!("Couldn't parse"))
-            }
-        }
-    }
+    dbg!(&geom.active_window_frame);
 
-    #[derive(StructOpt)]
-    pub enum NinthColumn {
-        Left,
-        Centre,
-        Right,
-    }
+    dbg!(&current_output_frame);
+    dbg!(&new_output_frame);
 
-    impl std::str::FromStr for NinthColumn {
-        type Err = Error;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            match s {
-                "left" => Ok(Self::Left),
-                "centre" => Ok(Self::Centre),
-                "right" => Ok(Self::Right),
-                _ => Err(anyhow!("Couldn't parse")),
-            }
-        }
-    }
+    let pct_rect = geom.active_window_frame.as_dps(current_output_frame);
 
-    #[derive(StructOpt)]
-    pub enum NinthRow {
-        Top,
-        Centre,
-        Bottom,
-    }
+    dbg!(&pct_rect);
 
-    impl std::str::FromStr for NinthRow {
-        type Err = Error;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            match s {
-                "top" => Ok(Self::Top),
-                "centre" => Ok(Self::Centre),
-                "bottom" => Ok(Self::Bottom),
-                _ => Err(anyhow!("Couldn't parse")),
-            }
-        }
-    }
+    let new_rect = pct_rect.to_rect(new_output_frame);
 
-    #[derive(StructOpt)]
-    pub enum Ninth {
-        Edge(Edge),
-        Corner(Corner),
-        Column(NinthColumn),
-        Row(NinthRow),
-        Centre,
-    }
+    dbg!(&new_rect);
 
-    impl std::str::FromStr for Ninth {
-        type Err = Error;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            if s.starts_with("edge-") {
-                Ok(Self::Edge(Edge::from_str(s.trim_start_matches("edge-"))?))
-            } else if s.starts_with("corner-") {
-                Ok(Self::Corner(Corner::from_str(
-                    s.trim_start_matches("corner-"),
-                )?))
-            } else if s.starts_with("column-") {
-                Ok(Self::Column(NinthColumn::from_str(
-                    s.trim_start_matches("column-"),
-                )?))
-            } else if s.starts_with("row-") {
-                Ok(Self::Row(NinthRow::from_str(s.trim_start_matches("row-"))?))
-            } else if s == "centre" {
-                Ok(Self::Centre)
-            } else {
-                Err(anyhow!("Couldn't parse"))
-            }
-        }
-    }
-
-    #[derive(StructOpt)]
-    pub enum Placement {
-        Half(Edge),
-        Quarter(Quarter),
-        Ninth(Ninth),
-    }
-
-    impl std::str::FromStr for Placement {
-        type Err = Error;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            if s.starts_with("half-") {
-                Ok(Self::Half(Edge::from_str(s.trim_start_matches("half-"))?))
-            } else if s.starts_with("quarter-") {
-                Ok(Self::Quarter(Quarter::from_str(
-                    s.trim_start_matches("quarter-"),
-                )?))
-            } else if s.starts_with("ninth-") {
-                Ok(Self::Ninth(Ninth::from_str(
-                    s.trim_start_matches("ninth-"),
-                )?))
-            } else {
-                Err(anyhow!("Couldn't parse"))
-            }
-        }
-    }
-}
-
-// #[derive(StructOpt)]
-// struct MoveWindowToOutput {
-//     target: placement::Edge,
-// }
-
-// impl MoveWindowToOutput {
-//     fn run(self, options: GlobalOptions) -> Result<(), Error> {
-//         use std::cmp::Ordering;
-
-//         let cm = Connection::new()?;
-//         let root_window = cm.root_window()?;
-//         let resources = root_window.get_screen_resources_current()?;
-
-//         let screen = cm.root_screen()?;
-//         let screen_frame = geometry::ScreenBox::from_size(
-//             geometry::XSize::new(
-//                 screen.width_in_pixels() as i32,
-//                 screen.height_in_pixels() as i32,
-//             ),
-//         );
-
-//         let active_window = root_window.get_active_window()?;
-
-//         println!(
-//             "Will move window: {}",
-//             std::str::from_utf8(&active_window.get_property(
-//                 "_NET_WM_NAME",
-//                 cm.get_atom("UTF8_STRING")?,
-//                 512
-//             )?)?
-//         );
-
-//         let geom = active_window.get_geometry()?;
-//         let active_frame = geometry::ScreenBox::new(
-//             geometry::XPoint::new(
-//                 geom.x() as i32,
-//                 geom.y() as i32,
-//             ),
-//             geometry::XPoint::new(
-//                 geom.x() as i32 + geom.width() as i32,
-//                 geom.y() as i32 + geom.height() as i32,
-//             ),
-//         );
-
-//         let current_output = cm.get_output_id_for_window(active_window.xwin, &resources)?;
-
-//         let current_output_frame = cm.get_output_frame(&resources, &current_output)?;
-
-//         let outputs = cm.get_output_frames(&resources)?;
-
-//         let mut of = None;
-//         for (output, frame) in outputs {
-//             let info = cm.get_output_info(output, resources.config_timestamp())?;
-//             let name = std::str::from_utf8(info.name())?;
-//             if frame.min.x <= active_frame.max.x {
-//                 println!("Ignoring {} (left-of / equal-to active frame)", name);
-//                 continue;
-//             }
-
-//             let (hd, vd) = (
-//                 frame.horizontal_distance_from(active_frame),
-//                 frame.vertical_distance_from(active_frame),
-//             );
-//             of = match of {
-//                 None => Some((output, frame)),
-//                 Some((eo, ef)) => {
-//                     let (ehd, evd) = (
-//                         ef.horizontal_distance_from(active_frame),
-//                         ef.vertical_distance_from(active_frame),
-//                     );
-//                     match ehd.cmp(&hd) {
-//                         Ordering::Less => Some((eo, ef)),
-//                         Ordering::Greater => Some((output, frame)),
-//                         Ordering::Equal => match evd.cmp(&vd) {
-//                             Ordering::Less => Some((eo, ef)),
-//                             _ => Some((output, frame)),
-//                         },
-//                     }
-//                 }
-//             };
-//         }
-
-//         let (target, target_frame) = of.unwrap();
-
-//         let info = cm.get_output_info(target, resources.config_timestamp())?;
-//         let name = std::str::from_utf8(info.name())?;
-//         println!("Selected {}", name);
-
-//         let new_frame = screen_frame.location_of_rect_after_reparenting(
-//             active_frame,
-//             current_output_frame,
-//             target_frame,
-//         );
-
-//         println!("Source rect: {:#?}", active_frame);
-//         println!("Target rect: {:#?}", new_frame);
-
-//         if !cm.supports("_NET_MOVERESIZE_WINDOW")? {
-//             return Err(anyhow!("WM doesn't support _NET_MOVERESIZE_WINDOW"));
-//         }
-
-//         let flags = {
-//             let mut result = 0;
-//             // bits 8-11 are presence bits for x/y/w/h
-//             /* if x != -1 */
-//             {
-//                 result |= 1 << 8;
-//             }
-//             /* if y != -1 */
-//             {
-//                 result |= 1 << 9;
-//             }
-//             /* if w != -1 */
-//             {
-//                 result |= 1 << 10;
-//             }
-//             /* if h != -1 */
-//             {
-//                 result |= 1 << 11;
-//             }
-//             result
-//         };
-
-//         let ev = xcb::ClientMessageEvent::new(
-//             32,
-//             active_window,
-//             cm.get_type("_NET_MOVERESIZE_WINDOW")?,
-//             xproto::ClientMessageData::from_data32([
-//                 flags,
-//                 new_frame.origin.x as u32,
-//                 new_frame.origin.y as u32,
-//                 new_frame.size.width,
-//                 new_frame.size.height,
-//             ]),
-//         );
-
-//         cm.send_event(
-//             true,
-//             root_window,
-//             xproto::EVENT_MASK_SUBSTRUCTURE_NOTIFY | xproto::EVENT_MASK_SUBSTRUCTURE_REDIRECT,
-//             &ev,
-//         )?;
-
-//         Ok(())
-//     }
-// }
-
-#[derive(StructOpt)]
-struct PrintOutputs {}
-
-impl PrintOutputs {
-    fn run(self, options: GlobalOptions) -> Result<(), Error> {
-        let cm = Connection::new()?;
-        let root_window = cm.root_window()?;
-        let screen_resources = root_window.get_screen_resources_current()?;
-
-        let print_output_info = |output: &output::Output| -> Result<(), Error> {
-            let info = output.get_info(screen_resources.xsr.config_timestamp());
-            if let Err(_) = info.as_ref() {
-                return Err(anyhow!("???"));
-            }
-
-            let info = info.as_ref().as_ref().unwrap();
-            // match info.as_ref() {
-            //     Err(e) => 
-            //         return Err(anyhow!("???")),
-            //     Ok(info) => {
-                    let name = std::str::from_utf8(info.name())?;
-                    if info.connection() != xrandr::CONNECTION_CONNECTED as u8 {
-                        println!("{}: Disconnected", name);
-                        return Ok(());
-                    }
-                    let crtc = cm.get_crtc_info(info.crtc(), screen_resources.xsr.config_timestamp())?;
-                    let frame = geometry::ScreenBox::new(
-                        geometry::XPoint::new(
-                            crtc.x() as i32,
-                            crtc.y() as i32,
-                        ),
-                        geometry::XPoint::new(
-                            crtc.x() as i32 + crtc.width() as i32,
-                            crtc.y() as i32 + crtc.height() as i32,
-                        ),
-                    );
-
-                    println!("{}: {:#?}", name, frame);
-                // }
-            // }
-
-            Ok(())
-        };
-
-        for output in screen_resources.get_outputs() {
-            if let Err(e) = print_output_info(&output) {
-                println!("Error getting output info: {}", e)
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(StructOpt)]
-struct ResizeOnDisplay {}
-
-impl ResizeOnDisplay {
-    fn run(self, options: GlobalOptions) -> Result<(), Error> {
-        trace!("Running ResizeOnDisplay");
-
-        let cm = Connection::new()?;
-
-        let root_window = cm.root_window()?;
-
-        let active_window = window::Window {
-            cm: cm.clone(),
-            xwin: root_window.get_property("_NET_ACTIVE_WINDOW", xproto::ATOM_WINDOW, 1)?[0],
-        };
-
-        println!(
-            "active window: {}",
-            std::str::from_utf8(&active_window.get_property(
-                "_NET_WM_NAME",
-                cm.get_atom("UTF8_STRING")?,
-                512
-            )?)?
-        );
-
-        if !root_window.supports("_NET_MOVERESIZE_WINDOW")? {
-            return Err(anyhow!("WM doesn't support _NET_MOVERESIZE_WINDOW"));
-        }
-
-        let (x, y, w, h) = (0, 0, 800, 600);
-        let gravity_flags = {
-            let mut result = 0;
-            /* if x != -1 */
-            {
-                result |= 1 << 8;
-            }
-            /* if y != -1 */
-            {
-                result |= 1 << 9;
-            }
-            /* if w != -1 */
-            {
-                result |= 1 << 10;
-            }
-            /* if h != -1 */
-            {
-                result |= 1 << 11;
-            }
-            result
-        };
-
-        let ev = xcb::ClientMessageEvent::new(
-            32,
-            active_window.xwin,
-            cm.get_atom("_NET_MOVERESIZE_WINDOW")?,
-            xproto::ClientMessageData::from_data32([gravity_flags, x, y, w, h]),
-        );
-
-        root_window.send_event(
-            false,
-            xproto::EVENT_MASK_SUBSTRUCTURE_NOTIFY | xproto::EVENT_MASK_SUBSTRUCTURE_REDIRECT,
-            &ev,
-        )?;
-
-        cm.flush();
-
-        Ok(())
-    }
-}
-
-#[derive(StructOpt)]
-struct TestGetDisplays {}
-
-impl TestGetDisplays {
-    fn run(self, options: GlobalOptions) -> Result<(), Error> {
-        trace!("Running TestGetDisplays");
-
-        let cm = Connection::new()?;
-        let root_window = cm.root_window()?;
-
-        let client_list = root_window.get_property(
-            "_NET_CLIENT_LIST",
-            xproto::ATOM_WINDOW,
-            10,
-        )?.iter().map(|xwin| window::Window {
-            cm: cm.clone(),
-            xwin: *xwin,
-        }).collect::<Vec<_>>();
-
-        for window in client_list {
-            let window_name_bytes: Vec<u8> =
-                window.get_property("_NET_WM_NAME", cm.get_atom("UTF8_STRING")?, 512)?;
-            println!("{}", std::str::from_utf8(&window_name_bytes)?);
-        }
-
-        Ok(())
-    }
+    geom
+      .root_win
+      .move_resize(&conn, geom.active_window, new_rect)
+  }
 }
 
 fn main() -> Result<(), Error> {
-    env_logger::init();
+  env_logger::init();
 
-    #[derive(StructOpt)]
-    enum Action {
-        TestGetDisplays(TestGetDisplays),
-        ResizeOnDisplay(ResizeOnDisplay),
-        PrintOutputs(PrintOutputs),
-        // MoveWindowToOutput(MoveWindowToOutput),
+  #[derive(StructOpt)]
+  enum Action {
+    MoveWindowOnOutput(MoveWindowOnOutput),
+    MoveWindowToOutput(MoveWindowToOutput),
+  }
+
+  #[derive(StructOpt)]
+  struct App {
+    #[structopt(flatten)]
+    options: GlobalOptions,
+    #[structopt(subcommand)]
+    action: Action,
+  }
+
+  impl App {
+    fn run(self) -> Result<(), Error> {
+      match self.action {
+        Action::MoveWindowOnOutput(opts) => opts.run(self.options),
+        Action::MoveWindowToOutput(opts) => opts.run(self.options),
+      }
     }
+  }
 
-    #[derive(StructOpt)]
-    struct App {
-        #[structopt(flatten)]
-        options: GlobalOptions,
-        #[structopt(subcommand)]
-        action: Action,
-    }
-
-    impl App {
-        fn run(self) -> Result<(), Error> {
-            match self.action {
-                Action::TestGetDisplays(opts) => opts.run(self.options),
-                Action::ResizeOnDisplay(opts) => opts.run(self.options),
-                Action::PrintOutputs(opts) => opts.run(self.options),
-                // Action::MoveWindowToOutput(opts) => opts.run(self.options),
-            }
-        }
-    }
-
-    App::from_args().run()
+  App::from_args().run()
 }

@@ -1,5 +1,5 @@
 [package]
-name = "alaroldai-tile"
+name = "x11-tile"
 version = "0.1.0"
 authors = ["Alastair Daivis <alaroldai@gmail.com>"]
 edition = "2018"
@@ -11,6 +11,13 @@ log = "0.4.8"
 env_logger = "0.7.1"
 structopt = "0.3.13"
 anyhow = "1.0.30"
-xcb = { version = "0.9.0", features = ["randr"] }
+# xcb = { path="../rust-xcb", features = ["randr", "thread"] }
 euclid = "0.20.11"
 syn = "1.0.23"
+crossbeam = "0.7.3"
+futures = "0.3.5"
+bitflags = "1.2.1"
+
+[dependencies.xcb]
+features = ["randr", "thread"]
+version = "0.9.0"
