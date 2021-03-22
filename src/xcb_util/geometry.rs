@@ -1,6 +1,7 @@
-use {
-  euclid::*,
-  xcb::{randr as xrandr, xproto},
+use euclid::*;
+use xcb::{
+  randr as xrandr,
+  xproto,
 };
 
 pub struct ScreenSpace;

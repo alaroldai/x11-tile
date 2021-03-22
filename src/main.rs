@@ -1,13 +1,23 @@
 mod xcb_util;
 
-use crate::xcb_util::{geometry::*, window::WindowExt};
+use log::debug;
+
+use crate::xcb_util::{
+  geometry::*,
+  window::WindowExt,
+};
 
 use std::str;
 
-use {
-  anyhow::{anyhow, Error},
-  structopt::StructOpt,
-  xcb::{base as xbase, randr as xrandr, xproto},
+use anyhow::{
+  anyhow,
+  Error,
+};
+use structopt::StructOpt;
+use xcb::{
+  base as xbase,
+  randr as xrandr,
+  xproto,
 };
 
 #[derive(StructOpt)]
@@ -20,9 +30,7 @@ struct Fract {
 }
 
 impl Fract {
-  fn value(&self) -> f32 {
-    self.num / self.denom
-  }
+  fn value(&self) -> f32 { self.num / self.denom }
 }
 
 impl std::str::FromStr for Fract {
@@ -48,7 +56,7 @@ struct Geometry<'a> {
   pub active_window_insets: ScreenInsets,
 }
 
-fn get_geometry(conn: & xbase::Connection) -> Result<Geometry, Error> {
+fn get_geometry(conn: &xbase::Connection) -> Result<Geometry, Error> {
   let setup = conn.get_setup();
 
   let screen = setup
@@ -82,8 +90,12 @@ fn get_geometry(conn: & xbase::Connection) -> Result<Geometry, Error> {
     })
     .collect();
 
+  debug!("display_frames: {:?}", display_frames);
+
   let gvec: Vec<i32> =
-    root_window.get_property(&conn, "_NET_WORKAREA", xproto::ATOM_CARDINAL, 4)?;
+    root_window.get_property(&conn, "_NET_WORKAREA", xproto::ATOM_CARDINAL, 8)?;
+
+  debug!("gvec: {:?}", gvec);
 
   let work_area = gvec
     .as_slice()
@@ -94,7 +106,9 @@ fn get_geometry(conn: & xbase::Connection) -> Result<Geometry, Error> {
         ScreenSize::new(slc[2] as i32, slc[3] as i32),
       )
     })
-    .collect::<Vec<ScreenRect>>()[0];
+    .collect::<Vec<ScreenRect>>();
+
+  debug!("Work area: {:?}", work_area);
 
   use xcb_util::geometry::*;
 
@@ -121,7 +135,7 @@ fn get_geometry(conn: & xbase::Connection) -> Result<Geometry, Error> {
     root_win_frame: root_window_rect,
     srs,
     display_frames,
-    work_areas: vec![work_area],
+    work_areas: work_area,
     active_window,
     active_window_frame,
     active_window_insets: insets,
@@ -136,26 +150,171 @@ struct MoveWindowOnOutput {
   h: Fract,
 }
 
+fn inset_frame_by_struts(conn: &xbase::Connection, mut frame: ScreenRect, root_window: xproto::Window) -> Result<ScreenRect, Error> {
+  let mut queue = vec![root_window];
+  while let Some(w) = queue.pop() {
+    let strut: Vec<i32> =
+      w.get_property(conn, "_NET_WM_STRUT_PARTIAL", xproto::ATOM_CARDINAL, 12)?;
+    if !strut.is_empty() {
+      #[derive(Debug)]
+      struct Strut {
+        left: i32,
+        right: i32,
+        top: i32,
+        bottom: i32,
+        left_start_y: i32,
+        left_end_y: i32,
+        right_start_y: i32,
+        right_end_y: i32,
+        top_start_x: i32,
+        top_end_x: i32,
+        bottom_start_x: i32,
+        bottom_end_x: i32,
+      }
+
+      let strut = Strut {
+        left: strut[0],
+        right: strut[1],
+        top: strut[2],
+        bottom: strut[3],
+        left_start_y: strut[4],
+        left_end_y: strut[5],
+        right_start_y: strut[6],
+        right_end_y: strut[7],
+        top_start_x: strut[8],
+        top_end_x: strut[9],
+        bottom_start_x: strut[10],
+        bottom_end_x: strut[11],
+      };
+
+      // TODO:
+      //  - Check if the strut-lines (NOT the whole rect) are contained within the
+      //    target display frame
+      //  - IF so, adjust the display frame
+
+      if strut.top > frame.origin.y
+        && strut.top < frame.origin.y + frame.size.height
+        && strut.top_start_x >= frame.origin.x
+        && strut.top_end_x <= frame.origin.x + frame.size.width
+      {
+        let overlap = strut.top - frame.origin.y;
+        debug!("Found strut (overlap: {}): {:#?}", overlap, strut);
+        frame.origin.y += overlap;
+        frame.size.height -= overlap;
+      }
+
+      if strut.left > frame.origin.x
+        && strut.left < frame.origin.x + frame.size.width
+        && strut.left_start_y >= frame.origin.y
+        && strut.left_end_y <= frame.origin.y + frame.size.height
+      {
+        let overlap = strut.left - frame.origin.x;
+        debug!("Found strut (overlap: {}): {:#?}", overlap, strut);
+        frame.origin.x += overlap;
+        frame.size.width -= overlap;
+      }
+
+      if strut.bottom < frame.origin.y + frame.size.height
+        && strut.bottom > frame.origin.y
+        && strut.bottom_start_x >= frame.origin.x
+        && strut.bottom_end_x <= frame.origin.x + frame.size.width
+      {
+        let overlap = frame.origin.y + frame.size.height - strut.bottom;
+        debug!("Found strut (overlap: {}): {:#?}", overlap, strut);
+        frame.size.height -= overlap;
+      }
+
+      if strut.right < frame.origin.x + frame.size.width
+        && strut.right > frame.origin.x
+        && strut.right_start_y >= frame.origin.y
+        && strut.right_end_y <= frame.origin.y + frame.size.height
+      {
+        let overlap = frame.origin.x + frame.size.width - strut.left;
+        debug!("Found strut (overlap: {}): {:#?}", overlap, strut);
+        frame.size.width -= overlap;
+      }
+    }
+    let mut children = xproto::query_tree(conn, w).get_reply()?.children().to_vec();
+
+    queue.append(&mut children);
+  }
+
+  Ok(frame)
+}
+
+//  TODO (alaroldai):
+//  Compute "output dimensions" by:
+//  - Getting the rects of connected outputs
+//  - Finding all windows that set the _NET_STRUT_PARTIAL
+//    - FOR EACH, Inset the rect of the containing output if necessary
+//  - Return the inset outputs.
+fn get_output_available_rect(conn: &xbase::Connection) -> Result<ScreenRect, Error> {
+  let setup = conn.get_setup();
+
+  let screen = setup
+    .roots()
+    .next()
+    .ok_or_else(|| anyhow!("Couldn't unwrap screen 0"))?;
+
+  let root_window = screen.root();
+
+  let active_window: xproto::Window =
+    root_window.get_property(&conn, "_NET_ACTIVE_WINDOW", xproto::ATOM_WINDOW, 1)?[0];
+
+  let mut active_window_frame = dbg!(active_window.get_geometry(&conn)?.as_rect());
+
+  let translated =
+    xproto::translate_coordinates(&conn, active_window, root_window, 0, 0).get_reply()?;
+  active_window_frame.origin.x = translated.dst_x() as i32;
+  active_window_frame.origin.y = translated.dst_y() as i32;
+
+  let srs = root_window.get_screen_resources_current(&conn)?;
+  let timestamp = srs.config_timestamp();
+
+  let mut display_frame = srs
+    .outputs()
+    .iter()
+    .filter_map(|o| {
+      let info = xrandr::get_output_info(&conn, *o, timestamp)
+        .get_reply()
+        .ok()?;
+      match info.connection() as u32 {
+        xrandr::CONNECTION_CONNECTED => {
+          let crtc = xrandr::get_crtc_info(&conn, info.crtc(), timestamp)
+            .get_reply()
+            .ok()?;
+          Some(crtc.as_rect())
+        }
+        _ => None,
+      }
+    })
+    .fold(None, |init: Option<ScreenRect>, frame| {
+      let new = frame.intersection(&active_window_frame);
+      debug!(
+        "{}: {} intersection with {}",
+        frame,
+        if new.is_some() { "Some" } else { "No" },
+        active_window_frame
+      );
+      match (new, init) {
+        (Some(new), Some(old)) if new.area() > old.area() => Some(frame),
+        (Some(_), None) => Some(frame),
+        _ => init,
+      }
+    })
+    .unwrap();
+
+  display_frame = inset_frame_by_struts(conn, display_frame, root_window)?;
+
+  Ok(display_frame)
+}
+
 impl MoveWindowOnOutput {
   fn run(self, _: GlobalOptions) -> Result<(), Error> {
     let (conn, _) = xbase::Connection::connect(None)?;
+    let display_frame = get_output_available_rect(&conn)?;
 
     let geom = get_geometry(&conn)?;
-
-    let current_display = geom
-      .display_frames
-      .iter()
-      .fold(None, |init: Option<ScreenRect>, frame| {
-        let new = frame.intersection(&geom.active_window_frame);
-        match (new, init) {
-          (Some(new), Some(old)) if new.area() > old.area() => Some(*frame),
-          (Some(_), None) => Some(*frame),
-          _ => init,
-        }
-      })
-      .unwrap();
-
-    let display_frame = current_display.intersection(&geom.work_areas[0]).unwrap();
 
     let pct = DisplayPercentageSpaceRect::new(
       DisplayPercentageSpacePoint::new(self.x.value(), self.y.value()),
@@ -168,9 +327,10 @@ impl MoveWindowOnOutput {
 
     dbg!(&new_rect);
 
-    // NOTE: Some window managers (Kwin and XFWM, for example) may refuse to position windows as requested
-    // if they are in a "tiled" or "maximised" state.
-    // In the case of Kwin, this can be fixed by using a window rule to force the "ignore requested geometry" flag to `false`.
+    // NOTE: Some window managers (Kwin and XFWM, for example) may refuse to
+    // position windows as requested if they are in a "tiled" or "maximised"
+    // state. In the case of Kwin, this can be fixed by using a window rule to
+    // force the "ignore requested geometry" flag to `false`.
     geom
       .root_win
       .move_resize(&conn, geom.active_window, new_rect)?;
@@ -209,7 +369,7 @@ impl MoveWindowToOutput {
   fn run(self, _: GlobalOptions) -> Result<(), Error> {
     let (conn, _) = xbase::Connection::connect(None)?;
 
-    let geom = get_geometry(&conn)?;
+    let mut geom = get_geometry(&conn)?;
 
     let (x, y) = match self.direction {
       Direction::West => (-1.0, 0.0),
@@ -232,7 +392,7 @@ impl MoveWindowToOutput {
           _ => init,
         }
       })
-      .and_then(|frame| frame.intersection(&geom.work_areas[0]))
+      .and_then(|frame| inset_frame_by_struts(&conn, frame, geom.root_win).ok())
       .unwrap();
 
     let new_output_frame = geom
@@ -275,24 +435,29 @@ impl MoveWindowToOutput {
       })
       .unwrap();
 
-    let new_output_frame = new_output_frame.intersection(&geom.work_areas[0]).unwrap();
+    let new_output_frame = inset_frame_by_struts(&conn, new_output_frame, geom.root_win)?;
 
     dbg!(&geom.active_window_frame);
 
+
+    // geom.active_window_frame = geom.active_window_frame.inner_rect(geom.active_window_insets);
+    dbg!(&geom.active_window_insets);
     dbg!(&current_output_frame);
     dbg!(&new_output_frame);
 
-    let pct_rect = geom.active_window_frame.as_dps(current_output_frame);
+    let decorated_source_frame = geom.active_window_frame.outer_rect(geom.active_window_insets);
+    let pct_rect = decorated_source_frame.as_dps(current_output_frame);
 
     dbg!(&pct_rect);
 
-    let new_rect = pct_rect.to_rect(new_output_frame);
+    let decorated_dest_frame = pct_rect.to_rect(new_output_frame);
+    let bare_dest_frame = decorated_dest_frame.inner_rect(geom.active_window_insets);
 
-    dbg!(&new_rect);
+    dbg!(&bare_dest_frame);
 
     geom
       .root_win
-      .move_resize(&conn, geom.active_window, new_rect)
+      .move_resize(&conn, geom.active_window, bare_dest_frame)
   }
 }
 

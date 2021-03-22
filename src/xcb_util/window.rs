@@ -1,10 +1,18 @@
-use {
-  anyhow::{anyhow, Error},
-  bitflags::bitflags,
-  xcb::{base as xbase, randr as xrandr, xproto},
+use anyhow::{
+  anyhow,
+  Error,
+};
+use bitflags::bitflags;
+use xcb::{
+  base as xbase,
+  randr as xrandr,
+  xproto,
 };
 
-use crate::xcb_util::{connection::ConnectionExt, geometry::*};
+use crate::xcb_util::{
+  connection::ConnectionExt,
+  geometry::*,
+};
 
 bitflags! {
     struct WMSizeHintsFlag: u32 {
@@ -162,13 +170,14 @@ impl WindowExt for xproto::Window {
       return Err(anyhow!("WM doesn't support _NET_MOVERESIZE_WINDOW"));
     }
 
-    // TODO: KWin's built-in window tiling seems to prevent this from working. Find out why.
-    // use xprop to examine window properties
+    // TODO: KWin's built-in window tiling seems to prevent this from working. Find
+    // out why. use xprop to examine window properties
 
     println!("running move_resize");
 
     // bits 8-11 are presence bits for x/y/w/h
-    // bits 12-15 indicate request source (bit 13 indicates a user-interactive source)
+    // bits 12-15 indicate request source (bit 13 indicates a user-interactive
+    // source)
     let flags = xproto::GRAVITY_STATIC | 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 12;
 
     let ev = xcb::ClientMessageEvent::new(

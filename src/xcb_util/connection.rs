@@ -1,4 +1,7 @@
-use xcb::{base as xbase, xproto};
+use xcb::{
+  base as xbase,
+  xproto,
+};
 
 use anyhow::Error;
 
